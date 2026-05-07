@@ -1,0 +1,6 @@
+__pycache__/
+.runlogs/
+kb_store.json
+chroma_db/
+.env
+*.pyc
