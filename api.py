@@ -6,13 +6,14 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from openai import OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 STORE_PATH = BASE_DIR / "kb_store.json"
 COLLECTION_NAME = "enterprise_internal_kb"
+MAX_HISTORY_MESSAGES = 6
 
 SAMPLE_DOCS = [
     "employee_handbook.md",
@@ -47,15 +48,38 @@ DIRECTORY = [
     },
 ]
 
+FOLLOW_UP_HINTS = [
+    "那",
+    "这个",
+    "这个呢",
+    "那个",
+    "那个呢",
+    "它",
+    "他",
+    "她",
+    "他们",
+    "继续",
+    "然后",
+    "再",
+    "还要",
+    "还需要",
+]
+
 DATA_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(title="企业内部知识库问答助手")
+
+
+class ChatMessage(BaseModel):
+    role: str = Field(..., pattern="^(user|assistant)$")
+    content: str
 
 
 class AskRequest(BaseModel):
     question: str
     top_k: int = 3
     retrieval_mode: str = "hybrid_rerank"
+    history: list[ChatMessage] = []
 
 
 def load_local_env(env_path: Path):
@@ -80,6 +104,12 @@ def split_text(text: str, chunk_size: int = 350, chunk_overlap: int = 60):
     cleaned = re.sub(r"\r\n?", "\n", text).strip()
     if not cleaned:
         return []
+
+    if "\n## " in cleaned:
+        sections = re.split(r"(?=\n##\s+)", f"\n{cleaned}")
+        heading_chunks = [section.strip() for section in sections if section.strip()]
+        if len(heading_chunks) > 1:
+            return heading_chunks
 
     paragraphs = [part.strip() for part in re.split(r"\n\s*\n", cleaned) if part.strip()]
     chunks = []
@@ -139,7 +169,17 @@ def build_llm_client():
 
 
 def tokenize(text: str):
-    return [token for token in re.split(r"[\s,，。！？；:：/()\-\[\]]+", text.lower()) if token]
+    lowered = text.lower()
+    raw_parts = re.findall(r"[a-z0-9@._-]+|[\u4e00-\u9fff]+", lowered)
+    tokens = []
+    for part in raw_parts:
+        if re.fullmatch(r"[\u4e00-\u9fff]+", part):
+            tokens.extend(list(part))
+            if len(part) > 1:
+                tokens.extend(part[i : i + 2] for i in range(len(part) - 1))
+        else:
+            tokens.append(part)
+    return tokens
 
 
 def normalize_scores(scores: list[float]):
@@ -223,6 +263,54 @@ def simple_rerank(question: str, candidates: list[dict]):
     return reranked
 
 
+def trim_history(history: list[ChatMessage]):
+    non_empty = [msg for msg in history if msg.content.strip()]
+    return non_empty[-MAX_HISTORY_MESSAGES:]
+
+
+def summarize_text(text: str, max_len: int = 120):
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[: max_len - 3] + "..."
+
+
+def format_conversation_context(history: list[ChatMessage]):
+    if not history:
+        return ""
+    lines = []
+    for message in history:
+        speaker = "用户" if message.role == "user" else "助手"
+        lines.append(f"{speaker}：{message.content.strip()}")
+    return "\n".join(lines)
+
+
+def build_search_query(question: str, history: list[ChatMessage]):
+    if not history:
+        return question.strip()
+
+    recent_user = ""
+    recent_assistant = ""
+    for message in reversed(history):
+        if not recent_assistant and message.role == "assistant":
+            recent_assistant = summarize_text(message.content)
+        elif recent_assistant and message.role == "user":
+            recent_user = summarize_text(message.content)
+            break
+
+    parts = [part for part in [recent_user, recent_assistant, question.strip()] if part]
+    return " ".join(parts) if parts else question.strip()
+
+
+def needs_previous_context(question: str):
+    stripped = question.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    short_question = len(stripped) <= 12
+    return short_question and any(hint in stripped or hint in lowered for hint in FOLLOW_UP_HINTS)
+
+
 def route_question(question: str):
     lowered = question.lower()
     directory_keywords = [
@@ -237,21 +325,29 @@ def route_question(question: str):
         "vpn",
         "账号",
         "权限",
+        "helpdesk",
     ]
-    if any(keyword in question for keyword in directory_keywords) or "helpdesk" in lowered:
+    if any(keyword in lowered or keyword in question for keyword in directory_keywords):
         return "directory_lookup"
     return "knowledge_base_search"
 
 
-def lookup_directory(question: str):
-    matched = []
+def lookup_directory(search_text: str):
+    query_tokens = tokenize(search_text)
+    scored = []
     for person in DIRECTORY:
-        haystack = " ".join(person.values()).lower()
-        if any(token in haystack for token in tokenize(question)):
-            matched.append(person)
+        haystack = " ".join(str(value) for value in person.values()).lower()
+        exact_hits = sum(1 for token in query_tokens if len(token) > 1 and token in haystack)
+        fuzzy_hits = sum(1 for token in query_tokens if len(token) == 1 and token in haystack)
+        score = exact_hits * 3 + fuzzy_hits
+        scored.append((score, person))
 
-    if not matched:
-        matched = DIRECTORY[:2]
+    scored.sort(key=lambda item: item[0], reverse=True)
+    top_score = scored[0][0] if scored else 0
+    if top_score > 0:
+        matched = [person for score, person in scored if score == top_score]
+    else:
+        matched = DIRECTORY[:1]
 
     lines = []
     for person in matched:
@@ -349,22 +445,28 @@ def delete_document(filename: str):
     }
 
 
-def answer_with_llm(question: str, references: list[dict]):
-    contexts = [row["text"] for row in references]
-    context_text = "\n\n".join([f"[引用{i + 1}] {doc}" for i, doc in enumerate(contexts)])
+def answer_with_llm(question: str, history: list[ChatMessage], references: list[dict]):
+    conversation_context = format_conversation_context(history) or "无"
+    retrieved_context = "\n\n".join([f"[引用{i + 1}] {row['text']}" for i, row in enumerate(references)]) or "无"
 
     prompt = f"""你是企业内部知识库问答助手。
-请严格基于给定上下文回答问题，不要编造制度、联系人或流程。
-如果上下文不足，请明确回答“根据当前知识库内容，无法准确回答这个问题”。
+请优先依据检索结果回答问题。历史对话仅用于补足指代、省略和追问含义，不允许仅依据历史编造制度、联系人或流程。
+如果历史和检索内容冲突，以检索内容为准。
+如果当前问题依赖历史才能理解，但当前上下文仍不足，请明确回答“当前上下文不足，请补充说明”。
+如果检索内容不足，请明确回答“根据当前知识库内容，无法准确回答这个问题”。
+如果同一段上下文里存在多个条件，请优先回答与当前问题最直接对应的条款，不要把附加条件当成主答案。
 
-上下文：
-{context_text}
+历史对话：
+{conversation_context}
 
-用户问题：{question}
+检索结果：
+{retrieved_context}
+
+当前问题：{question}
 
 输出要求：
 1. 先给出简洁答案
-2. 最后一行写“引用：”并列出使用到的引用编号
+2. 最后一行写“引用：”并列出使用到的引用编号；如果没有引用则写“引用：无”
 """
 
     client, model = build_llm_client()
@@ -374,6 +476,23 @@ def answer_with_llm(question: str, references: list[dict]):
         temperature=0,
     )
     return response.choices[0].message.content
+
+
+def build_references(rows: list[dict]):
+    return [
+        {
+            "text": row["text"],
+            "source": row["metadata"]["source"],
+            "chunk_index": row["metadata"]["chunk_index"],
+            "distance": row.get("distance"),
+            "dense_score": row.get("dense_score"),
+            "bm25_score": row.get("bm25_score"),
+            "hybrid_score": row.get("hybrid_score"),
+            "rerank_score": row.get("rerank_score"),
+            "keyword_overlap": row.get("keyword_overlap"),
+        }
+        for row in rows
+    ]
 
 
 @app.get("/health")
@@ -457,15 +576,32 @@ def ask(req: AskRequest):
     if not question:
         raise HTTPException(status_code=400, detail="问题不能为空。")
 
-    route = route_question(question)
+    history = trim_history(req.history)
+    history_used = len(history)
+    search_query = build_search_query(question, history)
+
+    if needs_previous_context(question) and not history:
+        return {
+            "question": question,
+            "route": "context_insufficient",
+            "retrieval_mode": req.retrieval_mode.strip().lower(),
+            "answer": "当前上下文不足，请补充说明。",
+            "references": [],
+            "search_query": search_query,
+            "history_used": history_used,
+        }
+
+    route = route_question(search_query)
     if route == "directory_lookup":
-        answer, references = lookup_directory(question)
+        answer, references = lookup_directory(search_query)
         return {
             "question": question,
             "route": route,
             "retrieval_mode": "structured_lookup",
             "answer": answer,
             "references": references,
+            "search_query": search_query,
+            "history_used": history_used,
         }
 
     collection = load_store()
@@ -474,34 +610,22 @@ def ask(req: AskRequest):
 
     mode = req.retrieval_mode.strip().lower()
     if mode == "keyword":
-        rows = keyword_retrieve(collection, question, req.top_k)
+        rows = keyword_retrieve(collection, search_query, req.top_k)
     elif mode == "hybrid":
-        rows = hybrid_retrieve(collection, question, req.top_k)
+        rows = hybrid_retrieve(collection, search_query, req.top_k)
     elif mode == "hybrid_rerank":
-        rows = simple_rerank(question, hybrid_retrieve(collection, question, req.top_k))
+        rows = simple_rerank(search_query, hybrid_retrieve(collection, search_query, req.top_k))
     else:
         raise HTTPException(status_code=400, detail="retrieval_mode 仅支持 keyword、hybrid、hybrid_rerank。")
 
-    references = [
-        {
-            "text": row["text"],
-            "source": row["metadata"]["source"],
-            "chunk_index": row["metadata"]["chunk_index"],
-            "distance": row.get("distance"),
-            "dense_score": row.get("dense_score"),
-            "bm25_score": row.get("bm25_score"),
-            "hybrid_score": row.get("hybrid_score"),
-            "rerank_score": row.get("rerank_score"),
-            "keyword_overlap": row.get("keyword_overlap"),
-        }
-        for row in rows
-    ]
-
-    answer = answer_with_llm(question, references)
+    references = build_references(rows)
+    answer = answer_with_llm(question, history, references)
     return {
         "question": question,
         "route": route,
         "retrieval_mode": mode,
         "answer": answer,
         "references": references,
+        "search_query": search_query,
+        "history_used": history_used,
     }
