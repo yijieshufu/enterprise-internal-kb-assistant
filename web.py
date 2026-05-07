@@ -36,8 +36,19 @@ def get_stats():
     return None
 
 
+def get_documents():
+    try:
+        resp = requests.get(f"{API_BASE}/documents", timeout=10)
+        if resp.ok:
+            return safe_json(resp).get("documents", [])
+    except Exception:
+        return []
+    return []
+
+
 health = get_health()
 stats = get_stats() if health else None
+documents = get_documents() if health else []
 
 with st.sidebar:
     st.header("服务状态")
@@ -49,14 +60,11 @@ with st.sidebar:
 
     if stats:
         st.metric("当前 chunk 数", stats.get("document_count", 0))
-        local_files = stats.get("local_files", [])
-        if local_files:
-            st.caption("本地文档")
-            for name in local_files:
-                st.write(f"- {name}")
+        st.metric("当前文档数", stats.get("document_file_count", 0))
 
     st.divider()
     st.header("数据准备")
+
     if st.button("导入内置企业文档", use_container_width=True):
         try:
             resp = requests.post(f"{API_BASE}/ingest-defaults", timeout=60)
@@ -94,6 +102,36 @@ with st.sidebar:
                 st.error(data.get("detail", resp.text))
         except requests.RequestException as exc:
             st.error(f"清空失败：{exc}")
+
+    st.divider()
+    st.header("文档管理")
+    if documents:
+        for doc in documents:
+            status = []
+            if doc.get("in_store"):
+                status.append(f"{doc.get('chunk_count', 0)} chunks")
+            if doc.get("local_file"):
+                status.append("本地文件")
+
+            with st.expander(doc["filename"]):
+                st.caption(" | ".join(status) if status else "未入库")
+                if st.button(f"删除 {doc['filename']}", key=f"delete_{doc['filename']}", use_container_width=True):
+                    try:
+                        resp = requests.delete(
+                            f"{API_BASE}/documents",
+                            params={"filename": doc["filename"]},
+                            timeout=30,
+                        )
+                        data = safe_json(resp)
+                        if resp.ok:
+                            st.success(data["message"])
+                            st.rerun()
+                        else:
+                            st.error(data.get("detail", resp.text))
+                    except requests.RequestException as exc:
+                        st.error(f"删除失败：{exc}")
+    else:
+        st.caption("当前没有可管理的文档。")
 
 
 st.subheader("示例问题")

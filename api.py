@@ -1,10 +1,10 @@
+import json
 import math
 import os
 import re
-import json
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from openai import OpenAI
 from pydantic import BaseModel
 
@@ -152,7 +152,7 @@ def normalize_scores(scores: list[float]):
     return [(score - min_score) / (max_score - min_score) for score in scores]
 
 
-def dense_retrieve(collection, question: str, top_k: int):
+def keyword_retrieve(collection: list[dict], question: str, top_k: int):
     rows = []
     query_tokens = set(tokenize(question))
     for item in collection:
@@ -171,9 +171,8 @@ def dense_retrieve(collection, question: str, top_k: int):
     return rows[:top_k]
 
 
-def hybrid_retrieve(collection, question: str, top_k: int):
+def hybrid_retrieve(collection: list[dict], question: str, top_k: int):
     query_tokens = set(tokenize(question))
-
     dense_raw_scores = []
     keyword_raw_scores = []
     rows = []
@@ -218,13 +217,7 @@ def simple_rerank(question: str, candidates: list[dict]):
         overlap = sum(1 for token in text_tokens if token in query_tokens)
         bonus = overlap / max(len(query_tokens), 1)
         rerank_score = item["hybrid_score"] + 0.2 * bonus
-        reranked.append(
-            {
-                **item,
-                "keyword_overlap": overlap,
-                "rerank_score": rerank_score,
-            }
-        )
+        reranked.append({**item, "keyword_overlap": overlap, "rerank_score": rerank_score})
 
     reranked.sort(key=lambda x: x["rerank_score"], reverse=True)
     return reranked
@@ -304,6 +297,58 @@ def ingest_text(filename: str, text: str):
     return len(chunks)
 
 
+def list_documents():
+    store = load_store()
+    chunk_count_by_source = {}
+    for item in store:
+        source = item["metadata"]["source"]
+        chunk_count_by_source[source] = chunk_count_by_source.get(source, 0) + 1
+
+    local_paths = {path.name: path for path in DATA_DIR.glob("*") if path.is_file()}
+    all_sources = sorted(set(chunk_count_by_source) | set(local_paths))
+
+    documents = []
+    for source in all_sources:
+        path = local_paths.get(source)
+        documents.append(
+            {
+                "filename": source,
+                "chunk_count": chunk_count_by_source.get(source, 0),
+                "in_store": source in chunk_count_by_source,
+                "local_file": source in local_paths,
+                "size_bytes": path.stat().st_size if path else None,
+            }
+        )
+    return documents
+
+
+def delete_document(filename: str):
+    safe_name = Path(filename).name
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="文件名不能为空。")
+
+    store = load_store()
+    filtered = [item for item in store if item["metadata"]["source"] != safe_name]
+    removed_chunks = len(store) - len(filtered)
+    save_store(filtered)
+
+    file_path = DATA_DIR / safe_name
+    removed_file = False
+    if file_path.exists():
+        file_path.unlink()
+        removed_file = True
+
+    if removed_chunks == 0 and not removed_file:
+        raise HTTPException(status_code=404, detail="未找到目标文档。")
+
+    return {
+        "message": "文档已删除。",
+        "filename": safe_name,
+        "removed_chunks": removed_chunks,
+        "removed_file": removed_file,
+    }
+
+
 def answer_with_llm(question: str, references: list[dict]):
     contexts = [row["text"] for row in references]
     context_text = "\n\n".join([f"[引用{i + 1}] {doc}" for i, doc in enumerate(contexts)])
@@ -338,15 +383,26 @@ def health():
 
 @app.get("/stats")
 def stats():
+    store = load_store()
     local_docs = sorted([path.name for path in DATA_DIR.glob("*.md")]) + sorted(
         [path.name for path in DATA_DIR.glob("*.txt")]
     )
-    store = load_store()
     return {
         "collection": COLLECTION_NAME,
         "document_count": len(store),
+        "document_file_count": len({item["metadata"]["source"] for item in store}),
         "local_files": local_docs,
     }
+
+
+@app.get("/documents")
+def documents():
+    return {"documents": list_documents()}
+
+
+@app.delete("/documents")
+def remove_document(filename: str = Query(..., description="待删除的文件名")):
+    return delete_document(filename)
 
 
 @app.post("/clear")
@@ -413,12 +469,12 @@ def ask(req: AskRequest):
         }
 
     collection = load_store()
-    if len(collection) == 0:
+    if not collection:
         raise HTTPException(status_code=400, detail="知识库为空，请先导入内置文档或上传文件。")
 
     mode = req.retrieval_mode.strip().lower()
     if mode == "keyword":
-        rows = dense_retrieve(collection, question, req.top_k)
+        rows = keyword_retrieve(collection, question, req.top_k)
     elif mode == "hybrid":
         rows = hybrid_retrieve(collection, question, req.top_k)
     elif mode == "hybrid_rerank":
